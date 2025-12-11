@@ -14,17 +14,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, FrozenSet
 
 
-def _load_tokens() -> List[str]:
-    """Load GitHub tokens from env (comma/space separated)."""
-    raw = os.getenv("GITHUB_TOKENS", "")
-    if not raw:
-        return []
-    separators = [",", " ", "\n", "\t", ";"]
-    for sep in separators:
-        raw = raw.replace(sep, " ")
-    return [token.strip() for token in raw.split(" ") if token.strip()]
-
-
 # ============================================================================
 #                          熍断器配置 (Circuit Breaker)
 # ============================================================================
@@ -129,8 +118,21 @@ class Config:
     # ==================== GitHub Token 池 ====================
     # 多 Token 轮询可有效规避速率限制
     # 未认证: 10次/分钟, 认证: 30次/分钟
-    # 17个 Token 理论上可达 510次/分钟
-    github_tokens: List[str] = field(default_factory=_load_tokens)
+    # 多个 Token 可大幅提升扫描速度
+    # 
+    # 配置方式：
+    # 1. 直接在此列表中添加 token（不推荐，易泄露）
+    # 2. 设置环境变量 GITHUB_TOKENS（推荐，用逗号分隔多个token）
+    # 3. 创建 config_local.py 覆盖此配置（推荐）
+    github_tokens: List[str] = field(default_factory=lambda: (
+        # 优先从环境变量读取
+        os.getenv("GITHUB_TOKENS", "").split(",") if os.getenv("GITHUB_TOKENS") else [
+            # ===== 默认为空，请通过环境变量或 config_local.py 配置 =====
+            # 示例格式：
+            # "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            # "ghp_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+        ]
+    ))
     
     # Token 轮询索引
     _token_index: int = 0
@@ -139,10 +141,10 @@ class Config:
     db_path: str = "leaked_keys.db"
     
     # ==================== 线程配置 ====================
-    consumer_threads: int = 6  # 降级: 默认线程数降低，减少扫描强度
+    consumer_threads: int = 20  # 验证器线程数（IO 密集型，可开多）
     
     # ==================== 网络配置 ====================
-    request_timeout: int = 12  # 略微收紧超时时间，降低资源占用
+    request_timeout: int = 15  # HTTP 请求超时（秒）
     
     # ==================== 熍断器配置 ====================
     circuit_breaker_enabled: bool = True  # 是否启用熍断器
@@ -154,12 +156,38 @@ class Config:
     # 排除测试文件，专注高价值目标
     # 优化: 增加 NOT staging NOT sandbox 排除干扰
     search_keywords: List[str] = field(default_factory=lambda: [
-        # 轻量示例关键词（脱敏且低强度）
-        'filename:.env OPENAI_API_KEY',
+        # === 1. 狙击 .env 文件 (命中率最高) ===
+        'filename:.env OPENAI_API_KEY NOT staging NOT sandbox',
+        'filename:.env ANTHROPIC_API_KEY NOT staging',
         'filename:.env GEMINI_API_KEY',
-        'filename:.env anthropic_api_key',
-        'sk-proj- language:python',
-        'openai.azure.com api-key',
+        'filename:.env.local OPENAI_API_KEY',
+        'filename:.env.production sk-proj- NOT staging',
+        
+        # === 2. 狙击特定配置文件 ===
+        'filename:config.json sk-proj- NOT example NOT test',
+        'filename:secrets.yaml api_key NOT staging NOT sandbox',
+        'filename:secrets.json openai NOT example',
+        'filename:.env.example sk- NOT test NOT dev',
+        
+        # === 3. 狙击中转站配置 ===
+        'filename:.env BASE_URL openai NOT staging',
+        'filename:.env OPENAI_BASE_URL NOT sandbox',
+        'filename:config.py ONEAPI',
+        'new-api sk- NOT test NOT demo',
+        
+        # === 4. 排除干扰的精准搜索 ===
+        'sk-proj- language:python NOT test NOT example NOT mock NOT staging NOT sandbox',
+        'sk-ant-api03 language:python NOT test NOT example NOT staging',
+        'AIzaSy language:json NOT example NOT test NOT dev',
+        
+        # === 5. Anthropic Claude 狙击 ===
+        'filename:.env CLAUDE_API_KEY NOT staging',
+        'filename:.env anthropic_api_key NOT sandbox',
+        '"x-api-key" sk-ant- NOT test NOT example',
+        
+        # === 6. Azure OpenAI ===
+        'filename:.env AZURE_OPENAI_API_KEY NOT staging',
+        'openai.azure.com api-key NOT example NOT test NOT staging',
     ])
     
     # ==================== 平台默认 URL ====================
@@ -199,3 +227,38 @@ class Config:
 
 # 全局配置实例
 config = Config()
+
+# ============================================================================
+#                          本地配置覆盖 (config_local.py)
+# ============================================================================
+# 尝试导入本地配置文件以覆盖默认设置
+# config_local.py 应该包含真实的 tokens 和敏感配置
+# 该文件已被 .gitignore 忽略，不会被提交到 Git
+try:
+    from config_local import *
+    
+    # 如果 config_local.py 定义了 GITHUB_TOKENS，更新配置
+    if 'GITHUB_TOKENS' in dir():
+        config.github_tokens = GITHUB_TOKENS
+    
+    # 如果定义了 PROXY_URL，更新配置
+    if 'PROXY_URL' in dir() and PROXY_URL:
+        config.proxy_url = PROXY_URL
+    
+    # 如果定义了其他配置项，也可以在此更新
+    if 'DB_PATH' in dir():
+        config.db_path = DB_PATH
+    if 'CONSUMER_THREADS' in dir():
+        config.consumer_threads = CONSUMER_THREADS
+    if 'REQUEST_TIMEOUT' in dir():
+        config.request_timeout = REQUEST_TIMEOUT
+    
+    print("✅ 已加载本地配置文件 config_local.py")
+except ImportError:
+    # config_local.py 不存在，使用默认配置
+    if not config.github_tokens or not any(config.github_tokens):
+        print("⚠️  警告: 未配置 GitHub Tokens！")
+        print("   请创建 config_local.py 文件或设置环境变量 GITHUB_TOKENS")
+        print("   参考: config_local.py.example")
+except Exception as e:
+    print(f"⚠️  加载 config_local.py 时出错: {e}")

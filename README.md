@@ -1,311 +1,200 @@
-# GitHub Secret Scanner
+# GitHub Secret Scanner Pro
 
-```
-User: coff0xc (uid=1000)
-Type: Red Team Tool / Security Research
-Target: Leaked API Keys on GitHub (OpenAI, Claude, Gemini, Azure)
-```
+![Python](https://img.shields.io/badge/python-3.9+-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Status](https://img.shields.io/badge/status-active-success.svg)
 
-![TUI Dashboard](assets/screenshot.png)
-![TUI Dashboard](assets/screenshot1.png)
----
+🚀 **企业级 GitHub 密钥扫描与验证系统**
 
-## What is this?
+GitHub Secret Scanner Pro 是一款高性能的自动化工具，专为安全研究人员和红队设计。它利用 GitHub API 实时扫描代码库中的敏感密钥，并使用高并发异步架构进行深度有效性验证。
 
-扫 GitHub 上泄露的 API Key。
+> ⚠️ **免责声明**: 本项目仅用于授权的安全测试和教育目的。严禁用于非法扫描或利用他人凭证。使用者需自行承担所有法律责任。
 
-支持 OpenAI / Anthropic Claude / Google Gemini / Azure OpenAI，自动验证有效性，探测 GPT-4 权限和账户余额。
+## ✨ 核心特性
 
-Producer-Consumer 架构，asyncio + aiohttp 异步并发，Rich TUI 实时仪表盘。
+*   **⚡ 极致性能**: 基于 `asyncio` + `aiohttp` 的异步架构，支持 **100+ 高并发** 验证，吞吐量极高。
+*   **🎯 多平台支持**: 原生支持验证多种主流 AI 服务：
+    *   **OpenAI**: 支持标准 Key 及 Project Key，自动识别 GPT-4 权限、RPM 等级（企业级/免费试用）。
+    *   **Anthropic (Claude)**: 识别 Claude-3 Opus/Sonnet 等高价值模型。
+    *   **Google Gemini**: 识别 Gemini Pro 权限。
+    *   **Azure OpenAI**: 上下文感知的 Endpoint 提取与验证。
+*   **🛡️ 智能断路器**: 内置域名级断路器 (Circuit Breaker)，自动熔断不稳定的服务节点，防止阻塞扫描队列，同时具备防误杀保护。
+*   **🔍 深度价值评估**:
+    *   **GPT-4 探测**: 自动检测 Key 是否具备 GPT-4 访问权限。
+    *   **余额检测**: 探测中转站/API 的账户余额。
+    *   **RPM 透视**: 通过响应头分析速率限制，精准区分付费用户与试用用户。
+*   **📊 Rich TUI 仪表盘**: 使用 `rich` 库构建的终端用户界面，实时展示队列状态、扫描速度、成功率和详细日志。
+*   **🧠 智能过滤**:
+    *   **Sniper Dorks**: 精心设计的搜索语法，精准狙击 `.env`, `config.json` 等高价值文件，自动排除测试/示例代码。
+    *   **正则清洗**: 排除示例 Key (example, test, dev) 和低熵值字符串。
+    *   **黑名单机制**: 自动过滤高风险或无价值的域名。
+*   **💾 数据持久化**: 使用 SQLite 数据库存储所有结果，支持断点续传和自动去重。
 
-**本仓库为公开精简版。完整版私有，需要请联系 Coff0xc@protonmail.com**
+## 🚀 快速开始
 
----
+**想要立即开始？查看 [快速开始指南](QUICKSTART.md) 了解 5 分钟快速配置步骤！**
 
-## Screenshot
+## 🛠️ 安装
 
-### TUI 主界面
-
-![Main Dashboard](assets/screenshot.png)
-
-实时显示：
-- 扫描文件数 / 发现 Key 数 / 有效命中数
-- 当前搜索关键词 / Token 轮换状态
-- 有效 Key 列表（高价值 Key 金色高亮）
-- 实时日志流
-
-### 导出统计
-
-```
-$ python main.py --stats
-
-┌──────────────────────────────────────┐
-│            📊 数据库统计              │
-├──────────────────────────────────────┤
-│ 总 Key 数                        142 │
-│                                      │
-│ ✓ 有效                            23 │
-│ 💰 配额耗尽                        31 │
-│ ✗ 无效                            76 │
-│ 🔌 连接错误                        12 │
-│                                      │
-│ 平台分布                             │
-│   openai                          89 │
-│   anthropic                       28 │
-│   gemini                          15 │
-│   azure                           10 │
-└──────────────────────────────────────┘
-```
-
----
-
-## Features
-
-| 功能 | 说明 |
-|------|------|
-| **多平台验证** | OpenAI (sk-xxx / sk-proj-xxx), Anthropic (sk-ant-xxx), Gemini (AIza-xxx), Azure |
-| **GPT-4 探测** | 自动检测 Key 是否有 GPT-4/GPT-4o 权限 |
-| **余额探测** | 中转站余额检测，响应头 RPM 分析 |
-| **熵值过滤** | Shannon Entropy >= 3.8，过滤 `sk-test-123` 这类假 Key |
-| **黑名单过滤** | 跳过 `/test/`, `/examples/`, `localhost`, `ngrok.io` 等垃圾 |
-| **SHA 去重** | Git Blob SHA 级别去重，跨仓库不重复扫描同一文件 |
-| **断路器保护** | 域名级熔断，官方 API 域名白名单永不熔断 |
-| **持久化存储** | SQLite 双表存储，支持断点续传 |
-
----
-
-## Quick Start
-
-### 环境要求
-
-- Python >= 3.9
-- 代理（国内必需）
-
-### 安装
+确保你的 Python 版本 >= 3.9。
 
 ```bash
-git clone https://github.com/Coff0xc/Github-API-scan.git
-cd Github-API-scan
+# 克隆仓库
+git clone https://github.com/yourusername/github-secret-scanner.git
+cd github-secret-scanner
+
+# 安装依赖
+# 推荐安装 speedups 扩展以获得最佳性能
 pip install -r requirements.txt
 ```
 
-### 配置 GitHub Token
+## ⚙️ 配置
 
-GitHub Search API 有速率限制。未认证 10次/分钟，认证后 30次/分钟。
+### 1. 配置 GitHub Tokens
 
-多 Token 轮换可以提高效率：
+为了突破 GitHub API 的速率限制，系统支持 **Token 池轮询**。
+
+**创建 GitHub Personal Access Token:**
+
+1. 访问 https://github.com/settings/tokens
+2. 点击 "Generate new token (classic)"
+3. 选择权限范围（至少需要 `public_repo` 权限）
+4. 生成并复制 token
+
+**配置 Token:**
+
+**方式一：创建本地配置文件（推荐）**
 
 ```bash
-# Windows
-set GITHUB_TOKENS=ghp_xxxx,ghp_yyyy,ghp_zzzz
+# 复制配置模板
+cp config_local.py.example config_local.py
 
+# 编辑配置文件，填入你的 tokens
+```
+
+在 `config_local.py` 中添加：
+
+```python
+GITHUB_TOKENS = [
+    "ghp_xxxxxxxxxxxx",
+    "ghp_yyyyyyyyyyyy",
+    # 建议添加多个 token 以提高扫描速度
+]
+```
+
+**方式二：使用环境变量**
+
+```bash
 # Linux/Mac
-export GITHUB_TOKENS=ghp_xxxx,ghp_yyyy,ghp_zzzz
+export GITHUB_TOKENS="ghp_xxx,ghp_yyy,ghp_zzz"
+
+# Windows PowerShell
+$env:GITHUB_TOKENS = "ghp_xxx,ghp_yyy,ghp_zzz"
 ```
 
-Token 获取：GitHub Settings → Developer settings → Personal access tokens → Generate new token (classic)
+> ⚠️ **安全提示**: 永远不要将包含真实 token 的 `config.py` 提交到公共仓库！
 
-不需要任何权限，空权限即可用于 Search API。
+### 2. 配置代理（可选）
 
-### 配置代理
+如果需要使用代理访问 GitHub API 或 AI 服务 API：
 
-三种方式任选：
+*   **方法 A (环境变量)**:
+    ```bash
+    # Windows
+    set PROXY_URL=http://127.0.0.1:7890
+    
+    # Linux/Mac
+    export PROXY_URL=http://127.0.0.1:7890
+    ```
+*   **方法 B (配置文件)**:
+    修改 `config.py` 中的 `proxy_url` 字段。
+*   **方法 C (命令行参数)**:
+    运行时使用 `--proxy` 参数。
+
+## 🚀 使用方法
+
+### 启动扫描
+
+直接运行主程序即可启动 TUI 仪表盘并开始扫描：
 
 ```bash
-# 方式1: 环境变量
-set PROXY_URL=http://127.0.0.1:7890
-
-# 方式2: 命令行参数
-python main.py --proxy http://127.0.0.1:7890
-
-# 方式3: 修改 config.py
-proxy_url: str = "http://127.0.0.1:7890"
-```
-
-### 运行
-
-```bash
-# 启动扫描（TUI 模式）
 python main.py
-
-# 指定代理
-python main.py --proxy http://127.0.0.1:7890
-
-# 指定数据库路径
-python main.py --db my_keys.db
 ```
 
-按 `Ctrl+C` 停止扫描。
-
----
-
-## Export & Query
-
-### 导出有效 Key
+如果你需要指定代理：
 
 ```bash
-# 导出到文本文件
+python main.py --proxy http://127.0.0.1:7890
+```
+
+### 导出结果
+
+将数据库中的有效 Key 导出为文本文件：
+
+```bash
 python main.py --export output.txt
+```
 
-# 导出到 CSV（含详细元数据）
+导出为 CSV 格式（包含详细元数据：余额、模型分级、RPM等）：
+
+```bash
 python main.py --export-csv results.csv
+```
 
-# 仅导出特定状态
+仅导出特定状态的 Key：
+
+```bash
 python main.py --export output.txt --status valid
 python main.py --export output.txt --status quota_exceeded
 ```
 
 ### 查看统计
 
+查看数据库中的统计概览：
+
 ```bash
 python main.py --stats
 ```
 
-### 数据库交互查询
+## 📂 项目结构
 
-```bash
-python view_db.py
-```
+*   `main.py`: 程序入口，负责协调各组件。
+*   `scanner.py`: **生产者**。调用 GitHub Search API，下载文件并提取潜在 Key。
+*   `validator.py`: **消费者**。异步验证 Key 的有效性，执行深度探测。
+*   `config.py`: 配置文件，包含正则规则、搜索语法和 Token 池。
+*   `ui.py`: 基于 Rich 的终端界面实现。
+*   `database.py`: SQLite 数据库封装。
+*   `leaked_keys.db`: 默认数据存储文件。
 
-进入交互模式，可以执行任意 SQL：
+## 🤝 贡献
 
-```sql
-SELECT * FROM leaked_keys WHERE status = 'valid';
-SELECT * FROM leaked_keys WHERE is_high_value = 1;
-SELECT platform, COUNT(*) FROM leaked_keys GROUP BY platform;
-```
+欢迎贡献代码、报告问题或提出建议！
 
----
+- 📖 查看 [贡献指南](CONTRIBUTING.md) 了解如何参与
+- 🐛 [报告 Bug](https://github.com/YOUR_USERNAME/github-secret-scanner/issues)
+- 💡 [提出建议](https://github.com/YOUR_USERNAME/github-secret-scanner/issues)
 
-## Project Structure
+## 📚 相关文档
 
-```
-Github-API-scan/
-├── main.py          # 入口，Producer-Consumer 协调器
-├── scanner.py       # Producer: GitHub Search + 异步下载 + 过滤
-├── validator.py     # Consumer: 异步验证 + GPT-4探测 + 余额检测
-├── config.py        # 配置中心（正则、Dorks、断路器参数）
-├── database.py      # SQLite 封装，双表去重
-├── ui.py            # Rich TUI 仪表盘
-├── check_db.py      # 数据库快速检查
-├── view_db.py       # 数据库交互查询
-└── requirements.txt
-```
+- [快速开始指南](QUICKSTART.md) - 5 分钟快速配置
+- [GitHub 发布指南](GITHUB_PUBLISH_GUIDE.md) - 如何发布项目到 GitHub
+- [安全检查清单](SECURITY_CHECKLIST.md) - 发布前的安全检查
+- [贡献指南](CONTRIBUTING.md) - 如何参与项目开发
 
-### 核心流程
+## ⚠️ 免责声明
 
-```
-┌─────────────┐     Queue      ┌─────────────┐
-│   Scanner   │ ────────────▶  │  Validator  │
-│  (Producer) │   ScanResult   │  (Consumer) │
-└─────────────┘                └─────────────┘
-      │                              │
-      ▼                              ▼
- GitHub Search API            OpenAI/Claude/Gemini API
-      │                              │
-      ▼                              ▼
- Async Download               Async Validation
-      │                              │
-      ▼                              ▼
- Entropy Filter               GPT-4 Probe
- Blacklist Filter             Balance Probe
- SHA Dedup                    RPM Analysis
-      │                              │
-      └──────────────┬───────────────┘
-                     ▼
-               SQLite Database
-              (leaked_keys + scanned_blobs)
-```
+本项目仅用于**授权的安全测试和教育目的**。严禁用于非法扫描或利用他人凭证。
+
+使用者需自行承担所有法律责任。作者不对任何滥用行为负责。
+
+## 📝 许可证
+
+[MIT License](LICENSE)
+
+## 🌟 Star History
+
+如果这个项目对你有帮助，请考虑给它一个 Star ⭐
 
 ---
 
-## Configuration
-
-### 搜索关键词 (Dorks)
-
-编辑 `config.py` 中的 `search_keywords`：
-
-```python
-search_keywords: List[str] = field(default_factory=lambda: [
-    'filename:.env OPENAI_API_KEY',
-    'filename:.env GEMINI_API_KEY',
-    'filename:.env anthropic_api_key',
-    'sk-proj- language:python',
-    'openai.azure.com api-key',
-    # 添加你自己的 Dorks...
-])
-```
-
-公开版仅含 5 条示例。完整版包含 20+ 条高精度狙击规则。
-
-### 并发参数
-
-| 参数 | 位置 | 公开版默认值 |
-|------|------|-------------|
-| 下载并发 | `scanner.py` → `ASYNC_DOWNLOAD_CONCURRENCY` | 20 |
-| 验证并发 | `validator.py` → `MAX_CONCURRENCY` | 40 |
-| 验证线程 | `main.py` → `num_workers` | 2 |
-| 请求超时 | `config.py` → `request_timeout` | 12s |
-
-需要更高强度扫描可自行调整，或联系获取完整版。
-
-### 断路器参数
-
-```python
-CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5   # 连续失败次数触发熔断
-CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 60   # 熔断恢复时间（秒）
-CIRCUIT_BREAKER_HALF_OPEN_REQUESTS = 3  # 半开状态试探请求数
-```
-
-官方 API 域名（api.openai.com, api.anthropic.com 等）在白名单中，永不熔断。
-
----
-
-## Database Schema
-
-### leaked_keys 表
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | INTEGER | 主键 |
-| platform | TEXT | openai / anthropic / gemini / azure / relay |
-| api_key | TEXT | API Key（唯一索引） |
-| base_url | TEXT | 绑定的 API 地址 |
-| status | TEXT | pending / valid / invalid / quota_exceeded / connection_error |
-| balance | TEXT | 余额/模型信息 |
-| source_url | TEXT | GitHub 来源链接 |
-| model_tier | TEXT | GPT-4 / GPT-3.5 / Claude-3 / Gemini-Pro |
-| rpm | INTEGER | Rate Per Minute |
-| is_high_value | BOOLEAN | 高价值标记 |
-| found_time | DATETIME | 发现时间 |
-| verified_time | DATETIME | 验证时间 |
-
-### scanned_blobs 表
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| file_sha | TEXT | Git Blob SHA（主键） |
-| scan_time | DATETIME | 扫描时间 |
-
-用于跨仓库去重，相同内容的文件只扫描一次。
-
----
-
-## Disclaimer
-
-本项目仅用于安全研究和授权测试。
-
-严禁用于非法扫描或利用他人凭证。使用者自行承担法律责任。
-
----
-
-## Contact
-
-- Email: Coff0xc@protonmail.com
-- GitHub: [@Coff0xc](https://github.com/Coff0xc)
-- Blog：[@Coff0xc](https://coff0xc.github.io)
----
-
-## License
-
-MIT
+**Made with ❤️ for Security Researchers**

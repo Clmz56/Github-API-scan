@@ -33,8 +33,8 @@ from database import Database, LeakedKey, KeyStatus
 #                              常量与配置
 # ============================================================================
 
-# 最大并发数（降级：减少默认并发）
-MAX_CONCURRENCY = 40
+# 最大并发数
+MAX_CONCURRENCY = 100
 
 # 请求超时
 REQUEST_TIMEOUT = ClientTimeout(total=15, connect=10)

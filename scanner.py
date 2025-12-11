@@ -43,7 +43,7 @@ ENTROPY_THRESHOLD = 3.8
 
 # 异步下载配置
 # 并发数从 80 降至 60，降低重试开销，提升稳定性
-ASYNC_DOWNLOAD_CONCURRENCY = 20  # 降级: 默认并发降低，避免高压请求
+ASYNC_DOWNLOAD_CONCURRENCY = 60
 ASYNC_DOWNLOAD_TIMEOUT = ClientTimeout(total=15, connect=8)
 
 # 文件过滤配置
