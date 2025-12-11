@@ -109,7 +109,7 @@ DOMAIN_BLACKLIST = [
     'dummy',
     'sample',
     'mock',
-    # 新增：开发/测试环境域名
+    # 开发/测试环境域名
     'staging.',
     'sandbox.',
     'dev.',
@@ -119,6 +119,64 @@ DOMAIN_BLACKLIST = [
     '.internal',
     'ngrok.io',
     'localtunnel',
+]
+
+# 无效 base_url 黑名单（这些网站不是 API 中转站）
+INVALID_BASE_URL_DOMAINS = [
+    # 文档网站
+    'docs.djangoproject.com',
+    'docs.python.org',
+    'developer.mozilla.org',
+    'stackoverflow.com',
+    'medium.com',
+    'dev.to',
+    'readthedocs.io',
+    'gitbook.io',
+    # 其他 API 服务（非 OpenAI 兼容）
+    'themoviedb.org',
+    'tmdb.org',
+    'spotify.com',
+    'twitter.com',
+    'facebook.com',
+    'google.com/maps',
+    'maps.googleapis.com',
+    'youtube.com',
+    # 工具/框架网站
+    'prisma.io',
+    'pris.ly',
+    'vercel.com',
+    'netlify.com',
+    'heroku.com',
+    'railway.app',
+    'render.com',
+    # 其他无关网站
+    'every.to',
+    'makersuite.google.com',
+    'prompthor.com',
+    'agentrouter.org',  # 保留，看起来是真实中转站
+]
+
+# 已知有效中转站域名特征（优先级更高）
+KNOWN_RELAY_DOMAINS = [
+    'api.openai.com',
+    'api.anthropic.com',
+    # 常见中转站
+    'api.siliconflow.cn',
+    'api.deepseek.com',
+    'api.moonshot.cn',
+    'api.zhipuai.cn',
+    'api.baichuan-ai.com',
+    'api.minimax.chat',
+    'api.lingyiwanwu.com',
+    # 中转站特征关键词
+    'openai',
+    'chatgpt',
+    'gpt',
+    'llm',
+    'ai-gateway',
+    'one-api',
+    'new-api',
+    'chat-api',
 ]
 
 # 测试 Key 关键词（Key 中包含这些则跳过）
@@ -626,9 +684,50 @@ class GitHubScanner:
         match = self._azure_url_pattern.search(context)
         return match.group(0) if match else None
     
+    def _is_valid_relay_url(self, url: str) -> bool:
+        """
+        检查 URL 是否可能是有效的 API 中转站
+        
+        排除文档网站、无关 API 等
+        """
+        url_lower = url.lower()
+        
+        # 1. 检查无效域名黑名单
+        for invalid_domain in INVALID_BASE_URL_DOMAINS:
+            if invalid_domain in url_lower:
+                return False
+        
+        # 2. 检查是否包含已知中转站特征
+        for relay_keyword in KNOWN_RELAY_DOMAINS:
+            if relay_keyword in url_lower:
+                return True
+        
+        # 3. 检查 URL 路径是否像 API 端点
+        # 真正的中转站通常是简短的域名，不会有复杂路径
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.strip('/')
+            
+            # 排除有复杂路径的 URL（通常是文档链接）
+            if path and '/' in path and len(path) > 20:
+                return False
+            
+            # 排除明显的文档/设置页面
+            doc_indicators = ['docs', 'settings', 'ref/', 'guide', 'tutorial', 'help']
+            if any(ind in path.lower() for ind in doc_indicators):
+                return False
+                
+        except Exception:
+            pass
+        
+        return True
+    
     def _extract_base_url(self, context: str, platform: str) -> tuple:
         """
         从上下文提取 Base URL
+        
+        优化：增加中转站有效性检测
         
         Returns:
             (url, is_relay)
@@ -647,9 +746,21 @@ class GitHubScanner:
                 if len(url) < 10:
                     continue
                 
+                # ========== 新增：检查是否为有效中转站 URL ==========
+                if not self._is_valid_relay_url(url):
+                    continue
+                
                 # 计算优先级
                 priority = 0
                 url_lower = url.lower()
+                
+                # 已知中转站域名优先级最高
+                for relay_domain in KNOWN_RELAY_DOMAINS:
+                    if relay_domain in url_lower:
+                        priority += 5
+                        break
+                
+                # 其他关键词
                 for keyword in URL_PRIORITY_KEYWORDS:
                     if keyword in url_lower:
                         priority += 1
@@ -942,22 +1053,49 @@ class GitHubScanner:
         
         return found_count
     
-    def run(self):
-        """运行扫描器主循环"""
+    def run(self, resume: bool = False):
+        """
+        运行扫描器主循环
+        
+        Args:
+            resume: 是否从断点续传
+        """
         round_num = 0
+        keywords = config.search_keywords
+        total_keywords = len(keywords)
+        
+        # 断点续传：加载上次进度
+        start_index = 0
+        if resume:
+            progress = self.db.load_progress()
+            if progress["total"] == total_keywords and not progress["is_completed"]:
+                start_index = progress["current_index"]
+                self._log(f"从断点恢复: 关键词 {start_index + 1}/{total_keywords}", "INFO")
+            else:
+                self._log("未找到有效的断点，从头开始扫描", "INFO")
         
         while not self.stop_event.is_set():
             round_num += 1
             
-            for keyword in config.search_keywords:
+            for i, keyword in enumerate(keywords):
                 if self.stop_event.is_set():
                     break
+                
+                # 断点续传：跳过已完成的关键词（仅第一轮）
+                if round_num == 1 and i < start_index:
+                    continue
                 
                 self.search_keyword(keyword)
                 self._rotate_client()
                 
+                # 保存进度
+                self.db.save_progress(i + 1, total_keywords, is_completed=(i + 1 == total_keywords))
+                
                 if not self.stop_event.is_set():
                     time.sleep(0.5)
+            
+            # 本轮完成，标记进度
+            self.db.save_progress(total_keywords, total_keywords, is_completed=True)
             
             # 等待下一轮
             if not self.stop_event.is_set():
@@ -966,16 +1104,25 @@ class GitHubScanner:
                     if self.stop_event.is_set():
                         break
                     time.sleep(10)
+                
+                # 新一轮重置进度
+                self.db.reset_progress()
 
 
 def start_scanner(
     result_queue: queue.Queue,
     db: Database,
     stop_event: threading.Event,
-    dashboard = None
+    dashboard = None,
+    resume: bool = False
 ) -> threading.Thread:
-    """启动扫描器线程"""
+    """
+    启动扫描器线程
+    
+    Args:
+        resume: 是否从断点续传
+    """
     scanner = GitHubScanner(result_queue, db, stop_event, dashboard)
-    thread = threading.Thread(target=scanner.run, name="GitHubScanner", daemon=True)
+    thread = threading.Thread(target=lambda: scanner.run(resume=resume), name="GitHubScanner", daemon=True)
     thread.start()
     return thread

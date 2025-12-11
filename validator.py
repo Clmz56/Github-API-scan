@@ -366,8 +366,47 @@ class AsyncValidator:
     #                           异步验证方法
     # ========================================================================
     
+    def _is_likely_valid_relay(self, base_url: str) -> bool:
+        """
+        检查 URL 是否可能是有效的中转站
+        
+        排除明显不是 API 中转站的 URL
+        """
+        if not base_url:
+            return True  # 空 URL 会使用默认值
+        
+        url_lower = base_url.lower()
+        
+        # 无效域名黑名单
+        invalid_domains = [
+            'docs.djangoproject.com',
+            'docs.python.org',
+            'developer.mozilla.org',
+            'stackoverflow.com',
+            'themoviedb.org',
+            'prisma.io',
+            'pris.ly',
+            'every.to',
+            'makersuite.google.com',
+            '/settings',
+            '/ref/',
+            '/docs/',
+            '/guide',
+        ]
+        
+        for invalid in invalid_domains:
+            if invalid in url_lower:
+                return False
+        
+        return True
+    
     async def validate_openai(self, api_key: str, base_url: str) -> ValidationResult:
         """异步验证 OpenAI / 中转站 - 集成熍断器保护"""
+        
+        # ========== 新增：预检查 base_url 有效性 ==========
+        if not self._is_likely_valid_relay(base_url):
+            return ValidationResult(KeyStatus.INVALID, "base_url 无效")
+        
         if not base_url:
             base_url = config.default_base_urls["openai"]
         
@@ -671,35 +710,178 @@ class AsyncValidator:
                 continue
         return False
     
-    async def probe_billing(self, api_key: str, base_url: str) -> float:
-        """探测中转站余额"""
-        if not base_url or "api.openai.com" in base_url:
-            return 0.0
+    async def probe_billing(self, api_key: str, base_url: str) -> dict:
+        """
+        探测中转站/官方 API 余额
+        
+        返回:
+            {
+                'balance': float,      # 余额 (USD)
+                'used': float,         # 已使用
+                'limit': float,        # 总额度
+                'source': str          # 余额来源
+            }
+        """
+        result = {'balance': 0.0, 'used': 0.0, 'limit': 0.0, 'source': ''}
         
         headers = {"Authorization": f"Bearer {api_key}"}
         session = await self._get_session()
         proxy = self._get_proxy()
         
-        billing_paths = [
-            "/dashboard/billing/subscription",
-            "/v1/dashboard/billing/subscription", 
-            "/dashboard/billing/usage",
-            "/v1/dashboard/billing/credit_grants"
+        # ========== 1. OpenAI 官方余额检测 ==========
+        if not base_url or "api.openai.com" in base_url:
+            # 官方 API 余额查询需要 organization header
+            # 但大多数泄露的 Key 没有这个信息，跳过
+            return result
+        
+        # ========== 2. 中转站余额检测 ==========
+        billing_endpoints = [
+            # one-api / new-api 格式 (最常见)
+            {
+                'path': '/api/user/self',
+                'fields': ['quota', 'used_quota', 'data.quota', 'data.used_quota']
+            },
+            {
+                'path': '/api/user/info', 
+                'fields': ['quota', 'used_quota', 'balance', 'data.quota']
+            },
+            # OpenAI 兼容格式
+            {
+                'path': '/dashboard/billing/subscription',
+                'fields': ['hard_limit_usd', 'soft_limit_usd', 'system_hard_limit_usd']
+            },
+            {
+                'path': '/v1/dashboard/billing/subscription',
+                'fields': ['hard_limit_usd', 'soft_limit_usd']
+            },
+            {
+                'path': '/dashboard/billing/credit_grants',
+                'fields': ['total_granted', 'total_used', 'total_available']
+            },
+            # 其他中转站
+            {
+                'path': '/user/info',
+                'fields': ['balance', 'quota', 'credits', 'remaining']
+            },
+            {
+                'path': '/api/status',
+                'fields': ['quota', 'balance', 'credits']
+            },
         ]
         
-        for path in billing_paths:
+        for endpoint in billing_endpoints:
             try:
-                url = f"{base_url.rstrip('/')}{path}"
+                url = f"{base_url.rstrip('/')}{endpoint['path']}"
                 async with session.get(url, headers=headers, proxy=proxy) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        # 尝试多种字段
-                        balance = data.get('hard_limit_usd') or data.get('balance') or data.get('total_granted', 0)
-                        if balance:
-                            return float(balance)
+                        balance = self._extract_balance_from_response(data, endpoint['fields'])
+                        if balance > 0:
+                            result['balance'] = balance
+                            result['source'] = endpoint['path']
+                            return result
             except Exception:
                 continue
+        
+        return result
+    
+    def _extract_balance_from_response(self, data: dict, fields: list) -> float:
+        """
+        从响应数据中提取余额
+        
+        支持嵌套字段如 'data.quota'
+        """
+        for field in fields:
+            try:
+                value = data
+                for key in field.split('.'):
+                    if isinstance(value, dict):
+                        value = value.get(key)
+                    else:
+                        value = None
+                        break
+                
+                if value is not None and value != 0:
+                    balance = float(value)
+                    # one-api 的 quota 单位是 "500000" 表示 $5
+                    # 需要除以 100000 转换为美元
+                    if balance > 10000:
+                        balance = balance / 100000
+                    return balance
+            except (ValueError, TypeError, AttributeError):
+                continue
         return 0.0
+    
+    async def probe_quota_by_request(self, api_key: str, base_url: str) -> dict:
+        """
+        通过实际请求测试额度
+        
+        这是最准确的方法：尝试发送一个最小请求
+        
+        返回:
+            {
+                'has_quota': bool,     # 是否有额度
+                'error_type': str,     # 错误类型 (quota/rate_limit/auth/other)
+                'message': str         # 详细信息
+            }
+        """
+        if not base_url:
+            base_url = config.default_base_urls["openai"]
+        
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        session = await self._get_session()
+        proxy = self._get_proxy()
+        
+        # 最小化请求：1 token
+        chat_body = {
+            "model": "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": "1"}],
+            "max_tokens": 1
+        }
+        
+        for url in self._try_url_variants(base_url, "chat/completions"):
+            try:
+                async with session.post(url, headers=headers, json=chat_body, proxy=proxy) as resp:
+                    response_text = await resp.text()
+                    
+                    if resp.status == 200:
+                        return {'has_quota': True, 'error_type': None, 'message': '有额度'}
+                    
+                    elif resp.status == 429:
+                        # 区分配额耗尽 vs 速率限制
+                        if 'quota' in response_text.lower() or 'exceeded' in response_text.lower():
+                            return {'has_quota': False, 'error_type': 'quota', 'message': '配额耗尽'}
+                        elif 'rate' in response_text.lower():
+                            # 速率限制说明 Key 有效，只是请求太快
+                            return {'has_quota': True, 'error_type': 'rate_limit', 'message': '速率限制(有额度)'}
+                        else:
+                            return {'has_quota': False, 'error_type': 'quota', 'message': '429错误'}
+                    
+                    elif resp.status == 401:
+                        return {'has_quota': False, 'error_type': 'auth', 'message': '认证失败'}
+                    
+                    elif resp.status == 402:
+                        # Payment Required - 明确表示没钱
+                        return {'has_quota': False, 'error_type': 'quota', 'message': '需要付款'}
+                    
+                    elif resp.status == 400:
+                        # 检查是否为余额不足
+                        if 'insufficient' in response_text.lower() or 'quota' in response_text.lower():
+                            return {'has_quota': False, 'error_type': 'quota', 'message': '余额不足'}
+                        # 其他 400 错误可能是请求格式问题，Key 可能有效
+                        return {'has_quota': True, 'error_type': 'other', 'message': '请求错误'}
+                    
+                    else:
+                        return {'has_quota': False, 'error_type': 'other', 'message': f'HTTP {resp.status}'}
+                        
+            except asyncio.TimeoutError:
+                continue
+            except aiohttp.ClientConnectorError:
+                return {'has_quota': False, 'error_type': 'connection', 'message': '连接失败'}
+            except Exception:
+                continue
+        
+        return {'has_quota': False, 'error_type': 'other', 'message': '无法验证'}
     
     async def validate_single(self, result: 'ScanResult') -> ValidationResult:
         """验证单个结果（统一入口）"""
@@ -755,16 +937,29 @@ class AsyncValidator:
                 # 并行探测 GPT-4 和余额
                 gpt4_task = asyncio.create_task(self.probe_gpt4(result.api_key, result.base_url))
                 billing_task = asyncio.create_task(self.probe_billing(result.api_key, result.base_url))
+                quota_task = asyncio.create_task(self.probe_quota_by_request(result.api_key, result.base_url))
                 
-                has_gpt4, balance = await asyncio.gather(gpt4_task, billing_task)
+                has_gpt4, billing_result, quota_result = await asyncio.gather(
+                    gpt4_task, billing_task, quota_task
+                )
                 
                 if has_gpt4:
                     vr.model_tier = "GPT-4"
                     vr.is_high_value = True
                 
-                if balance > 0:
-                    vr.balance_usd = balance
+                # 使用余额检测结果
+                if billing_result.get('balance', 0) > 0:
+                    vr.balance_usd = billing_result['balance']
                     vr.is_high_value = True
+                
+                # 使用实际请求测试结果更新状态
+                if not quota_result.get('has_quota', True):
+                    if quota_result.get('error_type') == 'quota':
+                        vr.status = KeyStatus.QUOTA_EXCEEDED
+                        vr.info = quota_result.get('message', '配额耗尽')
+                    elif quota_result.get('error_type') == 'auth':
+                        vr.status = KeyStatus.INVALID
+                        vr.info = '认证失败'
             
             # 更新数据库
             balance_str = vr.info
