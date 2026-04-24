@@ -44,8 +44,16 @@ MAX_CONCURRENCY = 100
 # 请求超时
 REQUEST_TIMEOUT = ClientTimeout(total=15, connect=10)
 
-# 高价值模型列表
-HIGH_VALUE_MODELS = ['gpt-4', 'gpt-4-turbo', 'gpt-4o', 'gpt-4-32k', 'claude-3-opus']
+# 高价值模型列表 (2026 updated)
+HIGH_VALUE_MODELS = [
+    'gpt-4', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini', 'gpt-4-32k',
+    'gpt-4.5-preview', 'gpt-4.5',
+    'o1', 'o1-mini', 'o1-pro', 'o3', 'o3-mini', 'o4-mini',
+    'claude-3-opus', 'claude-3.5-sonnet', 'claude-3.7-sonnet',
+    'claude-sonnet-4', 'claude-opus-4',
+    'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-haiku-4-5',
+    'gemini-2.0-flash', 'gemini-2.5-pro', 'gemini-2.5-flash',
+]
 
 # RPM 阈值分级
 RPM_ENTERPRISE_THRESHOLD = 3000   # >= 3000 为企业级
@@ -470,10 +478,11 @@ class AsyncValidator:
                         data = await resp.json()
                         models_list = [m.get("id", "") for m in data.get("data", [])]
                         
-                        # 检测高价值模型
+                        # 检测高价值模型 (2026 updated)
                         for m in models_list:
-                            if any(hv in m.lower() for hv in ['gpt-4', 'gpt-4o']):
-                                model_tier = "GPT-4"
+                            ml = m.lower()
+                            if any(hv in ml for hv in ['gpt-4', 'gpt-4o', 'gpt-4.5', 'o1', 'o3', 'o4']):
+                                model_tier = "GPT-4+"
                                 break
                         
                         model_names = [m[:15] for m in models_list[:3]]
@@ -563,8 +572,11 @@ class AsyncValidator:
                     await self._record_circuit_result(url, success=True)
                     data = await resp.json()
                     models = data.get("models", [])
-                    # Gemini Pro 检测
-                    has_pro = any('gemini-1.5-pro' in m.get('name', '').lower() for m in models)
+                    # Gemini 2.x Pro detection
+                    has_pro = any(
+                        any(x in m.get('name', '').lower() for x in ['gemini-2.5-pro', 'gemini-2.0-pro', 'gemini-1.5-pro'])
+                        for m in models
+                    )
                     tier = "Gemini-Pro" if has_pro else "Gemini"
                     return ValidationResult(KeyStatus.VALID, f"{len(models)}模型", tier, 0, 0.0, has_pro)
                 elif resp.status == 429:
@@ -610,13 +622,13 @@ class AsyncValidator:
         # Anthropic 专用 Headers
         headers = {
             "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
+            "anthropic-version": "2024-10-22",
             "content-type": "application/json"
         }
-        
+
         # 必须 POST 请求
         body = {
-            "model": "claude-3-haiku-20240307",
+            "model": "claude-haiku-4-5-20251001",
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "Hi"}]
         }
@@ -634,10 +646,15 @@ class AsyncValidator:
                     # 尝试解析模型信息
                     try:
                         data = await resp.json()
-                        model_used = data.get("model", "claude-3")
-                        # 检测是否为高价值模型 (Opus/Sonnet)
-                        is_high = "opus" in model_used.lower() or "sonnet" in model_used.lower()
-                        tier = "Claude-3-Opus" if "opus" in model_used.lower() else "Claude-3"
+                        model_used = data.get("model", "claude")
+                        ml = model_used.lower()
+                        is_high = any(x in ml for x in ["opus", "sonnet-4", "claude-4"])
+                        if "opus" in ml:
+                            tier = "Claude-Opus"
+                        elif "sonnet" in ml:
+                            tier = "Claude-Sonnet"
+                        else:
+                            tier = "Claude"
                         return ValidationResult(KeyStatus.VALID, "Claude有效", tier, 0, 0.0, is_high)
                     except Exception:
                         return ValidationResult(KeyStatus.VALID, "Claude有效", "Claude-3", 0, 0.0, True)
@@ -732,7 +749,7 @@ class AsyncValidator:
             base_url = config.default_base_urls["openai"]
         
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        body = {"model": "gpt-4", "messages": [{"role": "user", "content": "1"}], "max_tokens": 1}
+        body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "1"}], "max_tokens": 1}
         
         session = await self._get_session()
         proxy = self._get_proxy()

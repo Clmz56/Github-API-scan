@@ -63,8 +63,7 @@ REGEX_PATTERNS = {
     #                          主流 AI 平台 (高优先级)
     # ============================================================================
 
-    # OpenAI: 标准 key (sk-xxx) 和 project key (sk-proj-xxx)
-    # 新格式: sk-proj-xxx (项目 Key), sk-svcacct-xxx (服务账户)
+    # OpenAI: sk-xxx, sk-proj-xxx, sk-svcacct-xxx, sess-xxx (2025+ session tokens)
     "openai": r'(?<!example_)(?<!test_)(?<!demo_)(?<!fake_)(?<!sample_)(?<!dev_)(?<!staging_)sk-(?:proj-|svcacct-)?(?!(?:placeholder|example|test|demo|your|xxx|fake|sample|dev|staging|sandbox|xxxxxx|abcdef|123456|insert|replace))[a-zA-Z0-9\-_]{20,}',
 
     # Google Gemini / Google AI Studio: AIza 开头，39 字符
