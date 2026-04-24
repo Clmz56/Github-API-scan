@@ -43,8 +43,8 @@ class SecretScanner:
     ):
         self.db = Database(config.db_path)
         self.dashboard = Dashboard()
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
-        self._stop = asyncio.Event()
+        self.queue: Optional[asyncio.Queue] = None
+        self._stop: Optional[asyncio.Event] = None
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="scanner")
 
         # Source toggles
@@ -114,6 +114,10 @@ class SecretScanner:
 
     async def run(self):
         """Main async entry point."""
+        # Initialize async objects inside the event loop
+        self.queue = asyncio.Queue(maxsize=5000)
+        self._stop = asyncio.Event()
+
         # Signal handling
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
