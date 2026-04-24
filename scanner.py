@@ -1198,6 +1198,13 @@ class GitHubScanner:
                 # 新一轮重置进度
                 self.db.reset_progress()
 
+        # Cleanup aiohttp session on exit
+        try:
+            loop = self._get_event_loop()
+            loop.run_until_complete(self._close_aiohttp_session())
+        except Exception:
+            pass
+
 
 def start_scanner(
     result_queue: queue.Queue,
