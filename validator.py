@@ -295,18 +295,20 @@ class AsyncValidator:
         self._circuit_breaker = circuit_breaker  # 使用全局熍断器
     
     async def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建 aiohttp session"""
+        """Get or create aiohttp session with connection pooling."""
         if self._session is None or self._session.closed:
-            # 配置代理
             connector = TCPConnector(
                 limit=MAX_CONCURRENCY,
+                limit_per_host=20,
+                ttl_dns_cache=300,
+                keepalive_timeout=30,
                 ssl=ssl.create_default_context(),
-                force_close=True
+                enable_cleanup_closed=True,
             )
             self._session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=REQUEST_TIMEOUT,
-                trust_env=True  # 支持环境变量代理
+                trust_env=True,
             )
         return self._session
     
