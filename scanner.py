@@ -26,9 +26,10 @@ from functools import lru_cache
 import aiohttp
 from aiohttp import ClientTimeout, TCPConnector
 from github import Github, GithubException, RateLimitExceededException
+from loguru import logger
 
 from config import (
-    config, REGEX_PATTERNS, BASE_URL_PATTERNS, 
+    config, REGEX_PATTERNS, BASE_URL_PATTERNS,
     AZURE_URL_PATTERN, AZURE_CONTEXT_KEYWORDS, URL_PRIORITY_KEYWORDS
 )
 from database import Database, LeakedKey, KeyStatus
@@ -371,16 +372,37 @@ class GitHubScanner:
     """
     
     def __init__(
-        self, 
-        result_queue: queue.Queue,
+        self,
+        result_queue,
         db: Database,
-        stop_event: threading.Event,
-        dashboard = None  # UI 仪表盘
+        stop_event,
+        dashboard = None  # UI dashboard
     ):
         self.result_queue = result_queue
         self.db = db
-        self.stop_event = stop_event
+        self._raw_stop_event = stop_event
         self.dashboard = dashboard
+
+        @property
+        def is_set():
+            if isinstance(stop_event, asyncio.Event):
+                return stop_event.is_set()
+            return stop_event.is_set()
+
+        # Create a threading.Event-like wrapper for asyncio.Event
+        if isinstance(stop_event, asyncio.Event):
+            class _StopBridge:
+                def __init__(self, evt):
+                    self._evt = evt
+                def is_set(self):
+                    return self._evt.is_set()
+                def set(self):
+                    self._evt.set()
+                def wait(self, timeout=None):
+                    time.sleep(timeout or 0)
+            self.stop_event = _StopBridge(stop_event)
+        else:
+            self.stop_event = stop_event
         
         # GitHub 客户端池
         self._github_clients: List[Github] = []
@@ -1091,9 +1113,24 @@ class GitHubScanner:
         
         for result in results:
             try:
-                self.result_queue.put(result, timeout=5)
+                # Support both sync queue.Queue and asyncio.Queue
+                if isinstance(self.result_queue, asyncio.Queue):
+                    # Called from sync context in executor - use thread-safe put
+                    loop = None
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        pass
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.result_queue.put(result), loop
+                        ).result(timeout=5)
+                    else:
+                        self.result_queue.put_nowait(result)
+                else:
+                    self.result_queue.put(result, timeout=5)
             except Exception as e:
-                logger.debug(f"异常: {type(e).__name__}")  # 队列满时跳过
+                logger.debug(f"Queue put failed: {type(e).__name__}")
             found_count += 1
             self.stats["total_found"] += 1
             

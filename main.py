@@ -1,65 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GitHub Secret Scanner Pro - 主程序入口
+GitHub Secret Scanner Pro v3.0 - Pure Asyncio Refactor
 
-================================================================================
-                              ⚠️ 免责声明 ⚠️
-================================================================================
-本项目仅用于安全研究和授权测试，严禁用于非法扫描。
-使用者需自行承担法律责任。
-================================================================================
-
-特性：
-- Rich TUI 仪表盘实时显示
-- 熵值过滤 + 域名黑名单
-- AsyncIO + aiohttp 高并发验证 (100 并发)
-- aiohttp 异步批量下载文件
-- 深度价值评估 (GPT-4 探测、余额检测、RPM 透视)
-- Producer-Consumer 架构
+Architecture:
+- Single asyncio event loop (no threading for core logic)
+- PyGithub calls run in thread executor (it's sync internally)
+- aiohttp for async downloads and validation
+- asyncio.Queue for producer-consumer pipeline
+- Rich TUI dashboard
 """
 
 import sys
 import signal
-import queue
-import threading
-import time
+import asyncio
 import argparse
 import csv
 from datetime import datetime
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+
+from loguru import logger
 
 from config import config
 from database import Database, KeyStatus
-from scanner import start_scanner
-from validator import start_validators
+from scanner import GitHubScanner, ScanResult
+from validator import AsyncValidator, ValidationResult, mask_key
 from ui import Dashboard
-from source_pastebin import start_pastebin_scanner
-from source_gist import start_gist_scanner
-from source_searchcode import start_searchcode_scanner
-from source_gitlab import start_gitlab_scanner
-from source_realtime import start_realtime_scanner
 
 
 class SecretScanner:
-    """密钥扫描系统主类"""
+    """Pure asyncio secret scanner - single event loop orchestration."""
 
-    def __init__(self, enable_pastebin: bool = False, enable_gist: bool = False,
-                 enable_searchcode: bool = False, enable_gitlab: bool = False,
-                 enable_realtime: bool = False, pastebin_api_key: str = ""):
-        self.stop_event = threading.Event()
-        self.result_queue = queue.Queue(maxsize=1000)
+    def __init__(
+        self,
+        enable_pastebin: bool = False,
+        enable_gist: bool = False,
+        enable_searchcode: bool = False,
+        enable_gitlab: bool = False,
+        enable_realtime: bool = False,
+        pastebin_api_key: str = "",
+    ):
         self.db = Database(config.db_path)
         self.dashboard = Dashboard()
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
+        self._stop = asyncio.Event()
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="scanner")
 
-        self.scanner_thread = None
-        self.validator_threads = []
-        self.pastebin_thread = None
-        self.gist_thread = None
-        self.searchcode_thread = None
-        self.gitlab_thread = None
-        self.realtime_thread = None
-
-        # 扫描源开关
+        # Source toggles
         self.enable_pastebin = enable_pastebin
         self.enable_gist = enable_gist
         self.enable_searchcode = enable_searchcode
@@ -67,205 +55,222 @@ class SecretScanner:
         self.enable_realtime = enable_realtime
         self.pastebin_api_key = pastebin_api_key
 
-        # 信号处理
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-    
-    def _signal_handler(self, signum, frame):
-        """信号处理"""
-        self.stop()
-    
-    def start(self):
-        """启动扫描系统"""
-        # 初始化仪表盘统计
+    async def _run_scanner(self):
+        """Run the GitHub scanner in executor (PyGithub is sync)."""
+        scanner = GitHubScanner(
+            result_queue=self.queue,
+            db=self.db,
+            stop_event=self._stop,
+            dashboard=self.dashboard,
+        )
+
+        loop = asyncio.get_running_loop()
+
+        # Run the blocking scanner.run() in a thread executor
+        # We wrap it to bridge the sync scanner with our async queue
+        def scanner_sync_runner():
+            scanner.run(resume=False)
+
+        await loop.run_in_executor(self._executor, scanner_sync_runner)
+
+    async def _run_validator(self, worker_id: int):
+        """Async validator consumer - processes queue items."""
+        validator = AsyncValidator(self.db, self.dashboard)
+
+        try:
+            while not self._stop.is_set():
+                # Collect a batch
+                batch = []
+                try:
+                    # Wait for first item
+                    result = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                    batch.append(result)
+
+                    # Drain more items without blocking
+                    while len(batch) < 50:
+                        try:
+                            result = self.queue.get_nowait()
+                            batch.append(result)
+                        except asyncio.QueueEmpty:
+                            break
+                except asyncio.TimeoutError:
+                    continue
+
+                if batch:
+                    self.dashboard.update_stats(queue_size=self.queue.qsize())
+                    await validator.run_batch(batch)
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await validator.close()
+
+    async def _run_dashboard(self):
+        """Dashboard refresh loop."""
+        while not self._stop.is_set():
+            self.dashboard.update_stats(queue_size=self.queue.qsize())
+            self.dashboard.refresh()
+            await asyncio.sleep(0.25)
+
+    async def run(self):
+        """Main async entry point."""
+        # Signal handling
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self._stop.set)
+
         self.dashboard.update_stats(
             total_tokens=len(config.github_tokens),
-            is_running=True
+            is_running=True,
         )
 
-        # 启动验证器（Consumer）
-        self.validator_threads = start_validators(
-            self.result_queue,
-            self.db,
-            self.stop_event,
-            dashboard=self.dashboard,
-            num_workers=2
-        )
-
-        # 启动 GitHub 扫描器（Producer）
-        self.scanner_thread = start_scanner(
-            self.result_queue,
-            self.db,
-            self.stop_event,
-            dashboard=self.dashboard
-        )
-
-        # 启动 Pastebin 扫描器
-        if self.enable_pastebin:
-            self.pastebin_thread = start_pastebin_scanner(
-                self.result_queue,
-                self.stop_event,
-                dashboard=self.dashboard,
-                api_key=self.pastebin_api_key
-            )
-            self.dashboard.add_log("[Pastebin] 扫描源已启用", "INFO")
-
-        # 启动 Gist 扫描器
-        if self.enable_gist:
-            self.gist_thread = start_gist_scanner(
-                self.result_queue,
-                self.stop_event,
-                dashboard=self.dashboard
-            )
-            self.dashboard.add_log("[Gist] 扫描源已启用", "INFO")
-
-        # 启动 SearchCode 扫描器
-        if self.enable_searchcode:
-            self.searchcode_thread = start_searchcode_scanner(
-                self.result_queue,
-                self.stop_event,
-                dashboard=self.dashboard
-            )
-            self.dashboard.add_log("[SearchCode] 扫描源已启用", "INFO")
-
-        # 启动 GitLab 扫描器
-        if self.enable_gitlab:
-            self.gitlab_thread = start_gitlab_scanner(
-                self.result_queue,
-                self.stop_event,
-                dashboard=self.dashboard
-            )
-            self.dashboard.add_log("[GitLab] 扫描源已启用", "INFO")
-
-        # 启动实时监控扫描器
-        if self.enable_realtime:
-            self.realtime_thread = start_realtime_scanner(
-                self.result_queue,
-                self.stop_event,
-                dashboard=self.dashboard
-            )
-            self.dashboard.add_log("[Realtime] 实时监控已启用", "INFO")
-
-        # 启动 TUI
+        # Start TUI
         with self.dashboard.start():
-            try:
-                while not self.stop_event.is_set():
-                    self.dashboard.update_stats(queue_size=self.result_queue.qsize())
-                    self.dashboard.refresh()
-                    time.sleep(0.25)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                self.stop()
-    
-    def stop(self):
-        """停止系统"""
-        if self.stop_event.is_set():
-            return
+            # Launch tasks
+            tasks = []
+
+            # Scanner (runs in executor)
+            tasks.append(asyncio.create_task(self._run_scanner()))
+
+            # Validators (2 async workers, each with 100 concurrency via semaphore)
+            for i in range(2):
+                tasks.append(asyncio.create_task(self._run_validator(i)))
+
+            # Dashboard refresh
+            tasks.append(asyncio.create_task(self._run_dashboard()))
+
+            # Optional sources (run in executor since they're sync)
+            if self.enable_pastebin:
+                tasks.append(asyncio.create_task(self._run_extra_source("pastebin")))
+            if self.enable_gist:
+                tasks.append(asyncio.create_task(self._run_extra_source("gist")))
+            if self.enable_searchcode:
+                tasks.append(asyncio.create_task(self._run_extra_source("searchcode")))
+            if self.enable_gitlab:
+                tasks.append(asyncio.create_task(self._run_extra_source("gitlab")))
+            if self.enable_realtime:
+                tasks.append(asyncio.create_task(self._run_extra_source("realtime")))
+
+            # Wait for stop signal
+            await self._stop.wait()
+
+            # Cancel all tasks
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         self.dashboard.stop()
-        self.stop_event.set()
+        self._executor.shutdown(wait=False)
+        logger.info("Scanner stopped.")
 
-        if self.scanner_thread and self.scanner_thread.is_alive():
-            self.scanner_thread.join(timeout=3)
+    async def _run_extra_source(self, source_type: str):
+        """Run extra scan sources in executor (they're sync/threaded)."""
+        import threading
 
-        if self.pastebin_thread and self.pastebin_thread.is_alive():
-            self.pastebin_thread.join(timeout=3)
+        stop_event = threading.Event()
+        loop = asyncio.get_running_loop()
 
-        if self.gist_thread and self.gist_thread.is_alive():
-            self.gist_thread.join(timeout=3)
+        # Bridge async stop to threading stop
+        async def watch_stop():
+            await self._stop.wait()
+            stop_event.set()
 
-        if self.searchcode_thread and self.searchcode_thread.is_alive():
-            self.searchcode_thread.join(timeout=3)
+        asyncio.create_task(watch_stop())
 
-        if self.gitlab_thread and self.gitlab_thread.is_alive():
-            self.gitlab_thread.join(timeout=3)
+        def run_source():
+            if source_type == "pastebin":
+                from source_pastebin import start_pastebin_scanner
+                t = start_pastebin_scanner(self.queue, stop_event, self.dashboard, self.pastebin_api_key)
+                t.join()
+            elif source_type == "gist":
+                from source_gist import start_gist_scanner
+                t = start_gist_scanner(self.queue, stop_event, self.dashboard)
+                t.join()
+            elif source_type == "searchcode":
+                from source_searchcode import start_searchcode_scanner
+                t = start_searchcode_scanner(self.queue, stop_event, self.dashboard)
+                t.join()
+            elif source_type == "gitlab":
+                from source_gitlab import start_gitlab_scanner
+                t = start_gitlab_scanner(self.queue, stop_event, self.dashboard)
+                t.join()
+            elif source_type == "realtime":
+                from source_realtime import start_realtime_scanner
+                t = start_realtime_scanner(self.queue, stop_event, self.dashboard)
+                t.join()
 
-        if self.realtime_thread and self.realtime_thread.is_alive():
-            self.realtime_thread.join(timeout=3)
+        await loop.run_in_executor(self._executor, run_source)
 
-        for thread in self.validator_threads:
-            if thread.is_alive():
-                thread.join(timeout=1)
 
+# ============================================================================
+#                          CLI Functions
+# ============================================================================
 
 def export_keys(db_path: str, output_file: str, status_filter: str = None):
-    """导出 Key"""
+    """Export keys to text file."""
     from rich.console import Console
-    from rich.table import Table
-    
+
     console = Console()
     db = Database(db_path)
-    
+
     if status_filter:
         try:
             status = KeyStatus(status_filter)
             keys = db.get_keys_by_status(status)
         except ValueError:
-            console.print(f"[red]无效状态: {status_filter}[/]")
+            console.print(f"[red]Invalid status: {status_filter}[/]")
             return
     else:
         keys = db.get_valid_keys()
-    
+
     if not keys:
-        console.print("[yellow]没有符合条件的 Key[/]")
+        console.print("[yellow]No keys found[/]")
         return
-    
-    # 写入文件
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(f"# GitHub Secret Scanner 导出结果\n")
-        f.write(f"# 时间: {datetime.now().isoformat()}\n")
-        f.write(f"# 数量: {len(keys)}\n")
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"# GitHub Secret Scanner Export\n")
+        f.write(f"# Time: {datetime.now().isoformat()}\n")
+        f.write(f"# Count: {len(keys)}\n")
         f.write("=" * 60 + "\n\n")
-        
+
         for key in keys:
-            f.write(f"平台: {key.platform}\n")
-            f.write(f"状态: {key.status}\n")
+            f.write(f"Platform: {key.platform}\n")
+            f.write(f"Status: {key.status}\n")
             f.write(f"Key: {key.api_key}\n")
             f.write(f"URL: {key.base_url}\n")
-            f.write(f"信息: {key.balance}\n")
-            f.write(f"来源: {key.source_url}\n")
+            f.write(f"Info: {key.balance}\n")
+            f.write(f"Source: {key.source_url}\n")
             f.write("-" * 40 + "\n\n")
-    
-    console.print(f"[green]✓ 已导出 {len(keys)} 个 Key 到 {output_file}[/]")
+
+    console.print(f"[green]Exported {len(keys)} keys to {output_file}[/]")
 
 
 def export_keys_csv(db_path: str, output_file: str, status_filter: str = None):
-    """导出 Key 到 CSV 文件"""
+    """Export keys to CSV."""
     from rich.console import Console
-    
+
     console = Console()
     db = Database(db_path)
-    
+
     if status_filter:
         try:
             status = KeyStatus(status_filter)
             keys = db.get_keys_by_status(status)
         except ValueError:
-            console.print(f"[red]无效状态: {status_filter}[/]")
+            console.print(f"[red]Invalid status: {status_filter}[/]")
             return
     else:
         keys = db.get_valid_keys()
-    
+
     if not keys:
-        console.print("[yellow]没有符合条件的 Key[/]")
+        console.print("[yellow]No keys found[/]")
         return
-    
-    # 写入 CSV 文件
+
     fieldnames = [
-        "id",
-        "platform",
-        "status",
-        "api_key",
-        "base_url",
-        "balance",
-        "source_url",
-        "model_tier",
-        "rpm",
-        "is_high_value",
-        "found_time",
+        "id", "platform", "status", "api_key", "base_url", "balance",
+        "source_url", "model_tier", "rpm", "is_high_value", "found_time",
     ]
-    
+
     with open(output_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -283,66 +288,65 @@ def export_keys_csv(db_path: str, output_file: str, status_filter: str = None):
                 "is_high_value": int(bool(getattr(key, "is_high_value", False))),
                 "found_time": key.found_time.isoformat() if getattr(key, "found_time", None) else "",
             })
-    
-    console.print(f"[green]✓ 已导出 {len(keys)} 个 Key 到 CSV: {output_file}[/]")
+
+    console.print(f"[green]Exported {len(keys)} keys to CSV: {output_file}[/]")
 
 
 def show_stats(db_path: str):
-    """显示统计"""
+    """Show database statistics."""
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
     from rich import box
-    
+
     console = Console()
     db = Database(db_path)
     stats = db.get_stats()
-    
-    # 统计表
+
     table = Table(show_header=False, box=box.ROUNDED)
-    table.add_column("项目", style="cyan")
-    table.add_column("数量", justify="right", style="white")
-    
-    table.add_row("总 Key 数", str(stats['total']))
+    table.add_column("Item", style="cyan")
+    table.add_column("Count", justify="right", style="white")
+
+    table.add_row("Total Keys", str(stats["total"]))
     table.add_row("", "")
-    
-    statuses = stats.get('statuses', {})
-    table.add_row("[green]✓ 有效[/]", f"[green]{statuses.get('valid', 0)}[/]")
-    table.add_row("[yellow]💰 配额耗尽[/]", f"[yellow]{statuses.get('quota_exceeded', 0)}[/]")
-    table.add_row("[red]✗ 无效[/]", f"[red]{statuses.get('invalid', 0)}[/]")
-    table.add_row("[magenta]🔌 连接错误[/]", f"[magenta]{statuses.get('connection_error', 0)}[/]")
-    
-    if stats.get('platforms'):
+
+    statuses = stats.get("statuses", {})
+    table.add_row("[green]Valid[/]", f"[green]{statuses.get('valid', 0)}[/]")
+    table.add_row("[yellow]Quota Exceeded[/]", f"[yellow]{statuses.get('quota_exceeded', 0)}[/]")
+    table.add_row("[red]Invalid[/]", f"[red]{statuses.get('invalid', 0)}[/]")
+    table.add_row("[magenta]Connection Error[/]", f"[magenta]{statuses.get('connection_error', 0)}[/]")
+
+    if stats.get("platforms"):
         table.add_row("", "")
-        table.add_row("[bold]平台分布[/]", "")
-        for platform, count in stats['platforms'].items():
+        table.add_row("[bold]Platforms[/]", "")
+        for platform, count in stats["platforms"].items():
             table.add_row(f"  {platform}", str(count))
-    
-    console.print(Panel(table, title="📊 数据库统计", border_style="cyan"))
+
+    console.print(Panel(table, title="Database Stats", border_style="cyan"))
 
 
 def main():
-    """主函数"""
+    """Entry point."""
     parser = argparse.ArgumentParser(
-        description="GitHub Secret Scanner Pro",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="GitHub Secret Scanner Pro v3.0",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument('--export', type=str, metavar='FILE', help='导出 Key 到文本文件')
-    parser.add_argument('--export-csv', type=str, metavar='CSV', help='导出 Key 到 CSV 文件')
-    parser.add_argument('--status', type=str, help='导出状态过滤 (valid/quota_exceeded)')
-    parser.add_argument('--stats', action='store_true', help='显示统计')
-    parser.add_argument('--db', type=str, default='leaked_keys.db', help='数据库路径')
-    parser.add_argument('--proxy', type=str, help='代理地址')
+    parser.add_argument("--export", type=str, metavar="FILE", help="Export keys to text file")
+    parser.add_argument("--export-csv", type=str, metavar="CSV", help="Export keys to CSV")
+    parser.add_argument("--status", type=str, help="Filter by status (valid/quota_exceeded)")
+    parser.add_argument("--stats", action="store_true", help="Show statistics")
+    parser.add_argument("--db", type=str, default="leaked_keys.db", help="Database path")
+    parser.add_argument("--proxy", type=str, help="Proxy URL")
 
-    # 扫描源选项
-    parser.add_argument('--pastebin', action='store_true', help='启用 Pastebin 扫描源')
-    parser.add_argument('--pastebin-key', type=str, default='', help='Pastebin Pro API Key')
-    parser.add_argument('--gist', action='store_true', help='启用 GitHub Gist 扫描源')
-    parser.add_argument('--searchcode', action='store_true', help='启用 SearchCode 扫描源')
-    parser.add_argument('--gitlab', action='store_true', help='启用 GitLab Snippets 扫描源')
-    parser.add_argument('--realtime', action='store_true', help='启用实时监控 (GitHub Events)')
-    parser.add_argument('--all-sources', action='store_true', help='启用所有扫描源')
+    # Scan sources
+    parser.add_argument("--pastebin", action="store_true", help="Enable Pastebin source")
+    parser.add_argument("--pastebin-key", type=str, default="", help="Pastebin Pro API Key")
+    parser.add_argument("--gist", action="store_true", help="Enable GitHub Gist source")
+    parser.add_argument("--searchcode", action="store_true", help="Enable SearchCode source")
+    parser.add_argument("--gitlab", action="store_true", help="Enable GitLab source")
+    parser.add_argument("--realtime", action="store_true", help="Enable GitHub Events realtime")
+    parser.add_argument("--all-sources", action="store_true", help="Enable all scan sources")
 
     args = parser.parse_args()
 
@@ -351,7 +355,7 @@ def main():
     if args.db:
         config.db_path = args.db
 
-    # 导出模式
+    # Export mode
     if args.export or args.export_csv:
         if args.export:
             export_keys(config.db_path, args.export, args.status)
@@ -359,27 +363,35 @@ def main():
             export_keys_csv(config.db_path, args.export_csv, args.status)
         return
 
-    # 统计模式
+    # Stats mode
     if args.stats:
         show_stats(config.db_path)
         return
 
-    # 扫描模式
-    enable_pastebin = args.pastebin or args.all_sources
-    enable_gist = args.gist or args.all_sources
-    enable_searchcode = args.searchcode or args.all_sources
-    enable_gitlab = args.gitlab or args.all_sources
-    enable_realtime = args.realtime or args.all_sources
+    # Validate config
+    if not config.github_tokens or not any(config.github_tokens):
+        logger.error("No GitHub tokens configured!")
+        logger.error("Set GITHUB_TOKENS env var or create config_local.py")
+        sys.exit(1)
 
+    # Enable uvloop if available
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        logger.info("uvloop enabled")
+    except ImportError:
+        pass
+
+    # Scan mode
     scanner = SecretScanner(
-        enable_pastebin=enable_pastebin,
-        enable_gist=enable_gist,
-        enable_searchcode=enable_searchcode,
-        enable_gitlab=enable_gitlab,
-        enable_realtime=enable_realtime,
-        pastebin_api_key=args.pastebin_key
+        enable_pastebin=args.pastebin or args.all_sources,
+        enable_gist=args.gist or args.all_sources,
+        enable_searchcode=args.searchcode or args.all_sources,
+        enable_gitlab=args.gitlab or args.all_sources,
+        enable_realtime=args.realtime or args.all_sources,
+        pastebin_api_key=args.pastebin_key,
     )
-    scanner.start()
+    asyncio.run(scanner.run())
 
 
 if __name__ == "__main__":
